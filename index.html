@@ -14,7 +14,6 @@
     button{border:0;background:#2563eb;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer}
     button#stop{background:#ef4444}
     canvas#view{pointer-events:none}
-
   </style>
 </head>
 <body>
@@ -35,37 +34,18 @@
 </div>
 
 <script>
-  // === Hugging Face 직링크 (resolve) ===
-  const MODEL_URL_FP32 = "https://huggingface.co/jdi1009/endoscope-assets/resolve/main/inference_model.onnx";
+  // ===== Config =====
+  const MODEL_URL_FP32 = "https://huggingface.co/jdi1009/endoscope-assets/resolve/main/inference_model.onnx"; // TODO: pin to commit SHA
   const LABELS_URL     = "https://huggingface.co/jdi1009/endoscope-assets/resolve/main/labels.json";
-  // FP16은 생략 (나중에 필요 시 추가)
 
-  // 입력 크기(모델 메타로 덮어씀)
-  let INPUT_W = 560, INPUT_H = 560;
+  let INPUT_W = 560, INPUT_H = 560; // will be overwritten by model meta
   const MEAN=[0.485,0.456,0.406], STD=[0.229,0.224,0.225];
   const CONF_TH=0.35, NMS_IOU=0.5, TOPK=100;
-  const LOAD_TIMEOUT_MS = 45000;
+  const LOAD_TIMEOUT_MS = 120000; // ↑ 45s -> 120s (CDN 지연 대비)
 
-  let inName = null;               // 실제 입력 텐서 이름
-  let ORT = null, session = null, labels = ["object"];
+  let inName=null, ORT=null, session=null, labels=["object"], expsBuf=null;
 
-  // --------- 공용 유틸 ----------
-  function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s);});}
-  async function ensureORT(){
-    // WebGPU 우선, 실패 시 WASM
-    try {
-      await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/webgpu/ort.webgpu.min.js");
-      if (window.ort && 'webgpu' in window.ort.env) return window.ort;
-    } catch(_) {}
-    await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js");
-    return window.ort;
-  }
-  function softmax(a){const m=Math.max(...a);const e=a.map(v=>Math.exp(v-m));const s=e.reduce((x,y)=>x+y,0);return e.map(v=>v/s)}
-  function cxcywh2xyxy(b,W=INPUT_W,H=INPUT_H){const[cx,cy,w,h]=b;return[(cx-w/2)*W,(cy-h/2)*H,(cx+w/2)*W,(cy+h/2)*H]}
-  function iou(a,b){const[ax1,ay1,ax2,ay2]=a,[bx1,by1,bx2,by2]=b;const ix1=Math.max(ax1,bx1),iy1=Math.max(ay1,by1);const ix2=Math.min(ax2,bx2),iy2=Math.min(ay2,by2);const iw=Math.max(0,ix2-ix1),ih=Math.max(0,iy2-iy1);const inter=iw*ih;const u=(ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter+1e-6;return inter/u}
-  function nms(d,thr=NMS_IOU){d.sort((a,b)=>b.score-a.score);const keep=[];for(const x of d){let ok=true;for(const y of keep){if(iou(x.xyxy,y.xyxy)>thr){ok=false;break}}if(ok)keep.push(x)}return keep}
-
-  // --------- DOM & 상태 ----------
+  // ===== DOM =====
   const cam=document.getElementById('cam');
   const canvas=document.getElementById('view');
   const ctx=canvas.getContext('2d');
@@ -76,165 +56,204 @@
   const startBtn=document.getElementById('start');
   const stopBtn=document.getElementById('stop');
 
-  let running=false, raf=0, last=performance.now(), emaFps=0;
+  let running=false, busy=false, raf=0, last=performance.now(), emaFps=0;
 
-  // --------- 버튼을 가장 먼저 바인딩 ----------
+  // ===== Utils =====
+  function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s);});}
+  async function ensureORT(){
+    // Try WebGPU build first (only if navigator.gpu exists)
+    if (navigator.gpu) {
+      try { await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/webgpu/ort.webgpu.min.js"); return window.ort; } catch(_) {}
+    }
+    // Fallback: WASM build
+    await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js");
+    return window.ort;
+  }
+  function cxcywh2xyxy(b,W=INPUT_W,H=INPUT_H){const[cx,cy,w,h]=b;return[(cx-w/2)*W,(cy-h/2)*H,(cx+w/2)*W,(cy+h/2)*H]}
+  function iou(a,b){const[ax1,ay1,ax2,ay2]=a,[bx1,by1,bx2,by2]=b;const ix1=Math.max(ax1,bx1),iy1=Math.max(ay1,by1);const ix2=Math.min(ax2,bx2),iy2=Math.min(ay2,by2);const iw=Math.max(0,ix2-ix1),ih=Math.max(0,iy2-iy1);const inter=iw*ih;const u=(ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter+1e-6;return inter/u}
+  function nms(d,thr=NMS_IOU){d.sort((a,b)=>b.score-a.score);const keep=[];for(const x of d){let ok=true;for(const y of keep){if(iou(x.xyxy,y.xyxy)>thr){ok=false;break}}if(ok)keep.push(x)}return keep}
+
+  // ===== Preprocess (pre-alloc) =====
+  const P={W:0,H:0,cv:null,ox:null,hw:0,arr:null};
+  function initPreprocess(W,H){
+    P.W=W; P.H=H; P.hw=W*H;
+    P.cv=(typeof OffscreenCanvas!=='undefined')?new OffscreenCanvas(W,H):(()=>{const c=document.createElement('canvas'); c.width=W; c.height=H; return c;})();
+    P.ox=P.cv.getContext('2d',{willReadFrequently:true});
+    P.arr=new Float32Array(3*P.hw);
+  }
+  function preprocess(video){
+    const {W,H,ox,hw,arr}=P;
+    ox.drawImage(video,0,0,W,H);
+    const rgba=ox.getImageData(0,0,W,H).data;
+    for(let i=0,j=0;i<hw;i++,j+=4){
+      const r=rgba[j]/255,g=rgba[j+1]/255,b=rgba[j+2]/255;
+      arr[i]=(r-MEAN[0])/STD[0];
+      arr[i+hw]=(g-MEAN[1])/STD[1];
+      arr[i+2*hw]=(b-MEAN[2])/STD[2];
+    }
+    return new ORT.Tensor('float32',arr,[1,3,H,W]);
+  }
+
+  // ===== Camera scheduling (rVFC if available) =====
+  const useVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  function scheduleNext(){
+    if(!running) return;
+    if(useVFC) cam.requestVideoFrameCallback(()=>tick());
+    else raf=requestAnimationFrame(()=>tick());
+  }
+
+  // ===== UI Handlers =====
   startBtn.addEventListener('click', async ()=>{
-    console.log('[UI] Start click');
     if(running) return;
     try{
-      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video:{ facingMode:'environment', width:{ideal:640}, height:{ideal:480}, frameRate:{ideal:30, max:30} },
+        audio:false
+      });
       cam.srcObject = stream; await cam.play();
+      // 확실히 적용
+      const vt=stream.getVideoTracks()[0];
+      vt.applyConstraints({frameRate:{ideal:30,max:30}, width:{ideal:640}, height:{ideal:480}}).catch(()=>{});
       connEl.textContent = session ? '연결됨' : '연결됨(모델 로딩중)';
-      running = true; raf = requestAnimationFrame(loop);
+      running=true; scheduleNext();
     }catch(e){
       console.error('[Camera] getUserMedia error', e);
-      alert('카메라 권한을 허용해 주세요.');
+      alert('카메라 권한을 허용해 주세요. 이 페이지는 HTTPS에서 동작해야 합니다.');
     }
   });
   stopBtn.addEventListener('click', ()=>{
-    console.log('[UI] Stop click');
     running=false; cancelAnimationFrame(raf);
     cam.srcObject?.getTracks()?.forEach(t=>t.stop());
     ctx.clearRect(0,0,canvas.width,canvas.height);
     connEl.textContent='연결끊김'; fpsEl.textContent='0'; latEl.textContent='0'; confEl.textContent='0';
   });
 
-  // --------- 전처리 ----------
-  function preprocess(video){
-    const W=INPUT_W, H=INPUT_H;
-    const useOff = typeof OffscreenCanvas!=='undefined';
-    const cv = useOff ? new OffscreenCanvas(W,H) : (()=>{const c=document.createElement('canvas'); c.width=W; c.height=H; return c;})();
-    const o = cv.getContext('2d',{willReadFrequently:true});
-    o.drawImage(video,0,0,W,H);
-    const {data}=o.getImageData(0,0,W,H);
-    const hw=W*H, arr=new Float32Array(3*hw);
-    for(let i=0;i<hw;i++){const r=data[i*4]/255,g=data[i*4+1]/255,b=data[i*4+2]/255;
-      arr[i]=(r-MEAN[0])/STD[0]; arr[i+hw]=(g-MEAN[1])/STD[1]; arr[i+2*hw]=(b-MEAN[2])/STD[2];}
-    return new ORT.Tensor('float32',arr,[1,3,H,W]);
-  }
+  // ===== Main Tick =====
+  async function tick(){
+    const tFrame=performance.now();
 
-  // --------- 메인 루프 ----------
-  async function loop(t){
+    // Preview only until model ready
+    if(!session || busy){
+      ctx.drawImage(cam,0,0,canvas.width,canvas.height);
+      if(!session) latEl.textContent='-';
+      scheduleNext();
+      return;
+    }
+
+    busy=true; // drop-frame 방식으로 백업 쌓임 방지
     const t0=performance.now();
 
-    // 세션 준비 전: 미리보기만
-    if(!session){
-      ctx.drawImage(cam,0,0,canvas.width,canvas.height);
-      latEl.textContent='-';
-      if(running) raf=requestAnimationFrame(loop);
-      return;
-    }
-
-    // 추론
-    const feeds = {};
+    // Inference
+    const feeds={};
     feeds[inName || (session.inputNames ? session.inputNames[0] : 'images')] = preprocess(cam);
+
     let out;
-    try {
-      out = await session.run(feeds);
-    } catch (e) {
-      console.error('OrtRun error', e);
-      connEl.textContent = '추론 오류(입력/크기)';
-      if (running) raf = requestAnimationFrame(loop);
-      return;
-    }
+    try{ out = await session.run(feeds); }
+    catch(e){ console.error('OrtRun error', e); connEl.textContent='추론 오류(입력/크기)'; busy=false; scheduleNext(); return; }
 
     const names = Object.keys(out);
     const logitsT = out[names.find(n=>n.toLowerCase().includes('logit')) || names[0]];
     const boxesT  = out[names.find(n=>n.toLowerCase().includes('box'))   || names[1]];
 
-    // 최초 1회 출력 디버그
-    if (!window.__dumped) {
-      console.log('out keys:', names);
-      console.log('logits dims:', logitsT.dims, 'boxes dims:', boxesT.dims);
-      window.__dumped = true;
+    // allocate reusable softmax buffer once
+    const logits = logitsT.data, boxes=boxesT.data;
+    const Q=boxes.length/4; const C=logits.length/Q; const FG=Math.min(labels.length || (C-1), C);
+    if(!expsBuf || expsBuf.length<C) expsBuf=new Float32Array(C);
+
+    const dets=[]; let maxScore=0;
+    for(let q=0;q<Math.min(Q,TOPK);q++){
+      const offs=q*C; let m=-1e9; for(let i=0;i<C;i++){ const v=logits[offs+i]; if(v>m)m=v; }
+      let sum=0; for(let i=0;i<C;i++){ const v=Math.exp(logits[offs+i]-m); expsBuf[i]=v; sum+=v; }
+      let best=0, idx=0; for(let i=0;i<FG;i++){ const p=expsBuf[i]/sum; if(p>best){best=p; idx=i;} }
+      if(best<CONF_TH) continue;
+      const xyxy=cxcywh2xyxy([boxes[q*4],boxes[q*4+1],boxes[q*4+2],boxes[q*4+3]], canvas.width, canvas.height);
+      dets.push({xyxy,label:labels[idx]??String(idx),score:best}); if(best>maxScore) maxScore=best;
     }
 
-    const logits = Array.from(logitsT.data);
-    const boxes  = Array.from(boxesT.data);
-    const Q = boxes.length / 4;
-    const C = logits.length / Q;
-    const FG = Math.min(labels.length || (C-1), C);
+    const final=nms(dets,NMS_IOU);
 
-    const dets = [];
-    let maxScore = 0;
-
-    for (let q=0; q<Math.min(Q,TOPK); q++) {
-      const slice = logits.slice(q*C, q*C + C);
-      const m = Math.max(...slice);
-      const exps = slice.map(v=>Math.exp(v-m));
-      const sum = exps.reduce((a,b)=>a+b,0);
-      const probs = exps.map(v=>v/sum);
-
-      let best = 0, idx = 0;        // 배경 제외
-      for (let i=0; i<FG; i++) if (probs[i] > best) { best = probs[i]; idx = i; }
-      if (best < CONF_TH) continue;
-
-      const xyxy = cxcywh2xyxy(boxes.slice(q*4, q*4+4), canvas.width, canvas.height);
-      dets.push({ xyxy, label: labels[idx] ?? String(idx), score: best });
-      if (best > maxScore) maxScore = best;
-    }
-
-    const final = nms(dets, NMS_IOU);
-
-    // ----- 화면 그리기 & 지표 -----
+    // draw
     ctx.drawImage(cam,0,0,canvas.width,canvas.height);
     ctx.lineWidth=2; ctx.font='14px system-ui';
     for(const d of final){
-      const [x1,y1,x2,y2]=d.xyxy;
-      ctx.strokeStyle='#18a058'; ctx.strokeRect(x1,y1,x2-x1,y2-y1);
-      const tag=`${d.label} ${d.score.toFixed(2)}`;
-      const tw=ctx.measureText(tag).width+6;
+      const [x1,y1,x2,y2]=d.xyxy; ctx.strokeStyle='#18a058'; ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+      const tag=`${d.label} ${d.score.toFixed(2)}`; const tw=ctx.measureText(tag).width+6;
       ctx.fillStyle='rgba(24,160,88,0.9)'; ctx.fillRect(x1,Math.max(0,y1-18),tw,18);
       ctx.fillStyle='#fff'; ctx.fillText(tag,x1+3,Math.max(12,y1-4));
     }
 
-    const lat=performance.now()-t0; latEl.textContent=lat.toFixed(1);
-    const dt=t-last; last=t; const fps=1000/dt; emaFps=emaFps?emaFps*0.9+fps*0.1:fps; fpsEl.textContent=emaFps.toFixed(1);
+    // metrics
+    const inferMs=performance.now()-t0; latEl.textContent=inferMs.toFixed(1);
+    const dt=tFrame-last; last=tFrame; const fps=1000/dt; emaFps=emaFps?emaFps*0.9+fps*0.1:fps; fpsEl.textContent=emaFps.toFixed(1);
     confEl.textContent=(maxScore*100).toFixed(1);
 
-    if(running) raf=requestAnimationFrame(loop);
+    busy=false; scheduleNext();
   }
 
-  // --------- 백그라운드로 모델 로딩 (루프 바깥!) ----------
-  (async ()=>{
+  // ===== Model loader (prefetch to buffer + progress + EP fallbacks) =====
+  async function loadModelWithFallback(){
+    ORT = await ensureORT();
+
+    // WASM tuning (fallback)
+    if(!navigator.gpu){
+      ORT.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+      ORT.env.wasm.simd = true;
+      ORT.env.wasm.proxy = true;
+      ORT.env.wasm.numThreads = Math.min(4, (navigator.hardwareConcurrency||2));
+      if (!self.crossOriginIsolated) ORT.env.wasm.numThreads = 1;
+    }
+
+    try{ labels = await fetch(LABELS_URL,{mode:'cors'}).then(r=>r.json()); }catch(e){ console.warn('labels.json load fail', e); }
+
+    // Prefetch model with progress
+    connEl.textContent='모델 다운로드중 0%';
+    const controller = new AbortController();
+    const toTimer = setTimeout(()=>controller.abort('timeout'), LOAD_TIMEOUT_MS);
+    let buf;
     try{
-      const timeout = new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), LOAD_TIMEOUT_MS));
-      ORT = await ensureORT();
+      const resp = await fetch(MODEL_URL_FP32,{mode:'cors', cache:'force-cache', signal:controller.signal});
+      if(!resp.ok) throw new Error('HTTP '+resp.status);
+      const len = Number(resp.headers.get('content-length'))||0;
+      if(resp.body && 'getReader' in resp.body){
+        const reader = resp.body.getReader(); const chunks=[]; let recvd=0;
+        for(;;){ const {done,value}=await reader.read(); if(done) break; chunks.push(value); recvd+=value.byteLength; if(len){ connEl.textContent = `모델 다운로드중 ${Math.round(recvd/len*100)}%`; } }
+        const total = chunks.reduce((a,c)=>a+c.byteLength,0); buf = new Uint8Array(total); let off=0; for(const c of chunks){ buf.set(c,off); off+=c.byteLength; }
+      } else {
+        buf = new Uint8Array(await resp.arrayBuffer());
+      }
+      clearTimeout(toTimer);
+    }catch(e){ clearTimeout(toTimer); throw e; }
 
-      // EP 선택
-      const hasWebGPU = !!ORT?.env?.webgpu;
-      const EP = hasWebGPU ? ['webgpu','wasm'] : ['wasm'];
+    // Try WebGPU first, then WASM explicitly
+    const tryCreate = async (provider)=>{
+      connEl.textContent = `모델 초기화중(${provider})`;
+      const ep = provider==='webgpu' ? ['webgpu'] : ['wasm'];
+      return ORT.InferenceSession.create(buf, { executionProviders: ep, graphOptimizationLevel:'all' });
+    };
 
-      // WASM 설정(폴백 시)
-      if (!hasWebGPU) {
-        ORT.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
-        ORT.env.wasm.numThreads = 2;
-        ORT.env.wasm.simd = true;
+    try{
+      if(navigator.gpu){
+        try{ session = await tryCreate('webgpu'); }
+        catch(e){ console.warn('WebGPU session failed, falling back to WASM', e); session = await tryCreate('wasm'); }
+      } else {
+        session = await tryCreate('wasm');
       }
 
-      try{ labels = await fetch(LABELS_URL).then(r=>r.json()); }catch(e){ console.warn('labels.json load fail', e); }
+      // input meta
+      const meta=session.inputMetadata; inName=session.inputNames?session.inputNames[0]:Object.keys(meta)[0];
+      const dims=meta[inName].dimensions; const H=Number(dims[2]), W=Number(dims[3]);
+      if(Number.isFinite(H)&&Number.isFinite(W)){ INPUT_H=H; INPUT_W=W; }
+      initPreprocess(INPUT_W, INPUT_H);
+      connEl.textContent = '준비됨(' + (navigator.gpu && session.executionProvider!=='wasm' ? 'webgpu' : 'wasm') + ')';
 
-      connEl.textContent='모델 로딩중';
-      const createPromise = ORT.InferenceSession.create(MODEL_URL_FP32, { executionProviders: EP, graphOptimizationLevel:'all' });
-      session = await Promise.race([createPromise, timeout]);
-
-      // ▶ 모델 메타에서 입력 이름/크기 확인
-      const meta = session.inputMetadata;
-      inName = session.inputNames ? session.inputNames[0] : Object.keys(meta)[0];
-      const dims = meta[inName].dimensions; // [N,C,H,W]
-      const H = Number(dims[2]), W = Number(dims[3]);
-      if (Number.isFinite(H) && Number.isFinite(W)) { INPUT_H = H; INPUT_W = W; }
-      console.log('model input size =', INPUT_W, INPUT_H, 'input name =', inName);
-
-      connEl.textContent='준비됨';
     }catch(e){
-      console.error(e);
-      connEl.textContent = (e?.message==='timeout') ? '모델 로딩 실패(네트워크/용량)' : '모델 로딩 실패';
+      console.error('Model load/init failed', e);
+      connEl.textContent='모델 로딩 실패';
     }
-  })();
+  }
+
+  // ===== Boot =====
+  (async ()=>{ await loadModelWithFallback(); })();
 </script>
-
-
 </body>
 </html>
