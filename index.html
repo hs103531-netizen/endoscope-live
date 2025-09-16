@@ -19,8 +19,8 @@
 <h2>Endoscope AI – Browser Inference</h2>
 
 <div class="row">
-  <video id="cam" autoplay playsinline style="width:480px"></video>
-  <canvas id="view" width="640" height="640"></canvas>
+  <video id="cam" autoplay playsinline style="display:none"></video>
+  <canvas id="view" width="960" height="720" style="width:960px; height:auto"></canvas>
 </div>
 
 <div id="panel">
@@ -52,9 +52,12 @@
   function loadScript(src){return new Promise((res,rej)=>{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s);});}
   async function ensureORT(){
     // WASM 번들만 로드(안정)
+    try {
+      await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/webgpu/ort.webgpu.min.js");
+      return (window.ort && 'webgpu' in window.ort.env) ? window.ort : null;
+    } catch (_) {}
     await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js");
-    ORT = window.ort;
-    return ORT;
+    return window.ort;
   }
 
   function softmax(a){const m=Math.max(...a);const e=a.map(v=>Math.exp(v-m));const s=e.reduce((x,y)=>x+y,0);return e.map(v=>v/s)}
@@ -113,74 +116,100 @@
     } catch (e) {
       console.error('OrtRun error', e);
       connEl.textContent = '추론 오류(입력/크기)';
-      if (running) raf = requestAnimationFrame(loop); // ← 에러여도 다음 프레임 계속
+      if (running) raf = requestAnimationFrame(loop);
       return;
+    }
+    
+    const names = Object.keys(out);
+    const logitsT = out[names.find(n=>n.toLowerCase().includes('logit')) || names[0]];
+    const boxesT  = out[names.find(n=>n.toLowerCase().includes('box'))   || names[1]];
+    
+    // ▶ 최초 1회 디버그 로그(출력 이름/shape)
+    if (!window.__dumped) {
+      console.log('out keys:', names);
+      console.log('logits dims:', logitsT.dims, 'boxes dims:', boxesT.dims);
+      window.__dumped = true;
+    }
+    
+    const logits = Array.from(logitsT.data);
+    const boxes  = Array.from(boxesT.data);
+    
+    // DETR 계열 가정: [1, Q, C], [1, Q, 4] (cx,cy,w,h는 0..1)
+    const Q = boxes.length / 4;
+    const C = logits.length / Q;
+    
+    // ▶ 실제 클래스 개수 = labels.json 길이 (배경 제외 추정)
+    const FG = Math.min(labels.length || (C-1), C);
+    
+    const dets = [];
+    let maxScore = 0;
+    
+    for (let q=0; q<Math.min(Q,TOPK); q++) {
+      const slice = logits.slice(q*C, q*C + C);
+      // softmax
+      const m = Math.max(...slice);
+      const exps = slice.map(v=>Math.exp(v-m));
+      const sum = exps.reduce((a,b)=>a+b,0);
+      const probs = exps.map(v=>v/sum);
+    
+      // ▶ 배경은 제외하고(0..FG-1) 최고 클래스 선택
+      let best = 0, idx = 0;
+      for (let i=0; i<FG; i++) {
+        if (probs[i] > best) { best = probs[i]; idx = i; }
       }
-    const names=Object.keys(out);
-    const logitsT=out[names.find(n=>n.toLowerCase().includes('logit'))||names[0]];
-    const boxesT =out[names.find(n=>n.toLowerCase().includes('box'))  ||names[1]];
-    const logits=Array.from(logitsT.data), boxes=Array.from(boxesT.data);
-
-    const Q=boxes.length/4, C=logits.length/Q, dets=[]; let maxScore=0;
-    for(let q=0;q<Math.min(Q,TOPK);q++){
-      const probs=softmax(logits.slice(q*C,q*C+C)); const bg=C-1; probs[bg]=-1;
-      let best=0,idx=0; for(let i=0;i<C-1;i++){ if(probs[i]>best){ best=probs[i]; idx=i; } }
-      if(best<CONF_TH) continue;
-      const xyxy=cxcywh2xyxy(boxes.slice(q*4,q*4+4), canvas.width, canvas.height);
-      dets.push({xyxy,label:labels[idx]??String(idx),score:best}); if(best>maxScore) maxScore=best;
+      if (best < CONF_TH) continue;
+    
+      const xyxy = cxcywh2xyxy(boxes.slice(q*4, q*4+4), canvas.width, canvas.height);
+      dets.push({ xyxy, label: labels[idx] ?? String(idx), score: best });
+      if (best > maxScore) maxScore = best;
     }
-    const final=nms(dets,NMS_IOU);
+    
+    const final = nms(dets, NMS_IOU);
 
-    ctx.drawImage(cam,0,0,canvas.width,canvas.height);
-    ctx.lineWidth=2; ctx.font='14px system-ui';
-    for(const d of final){
-      const [x1,y1,x2,y2]=d.xyxy; ctx.strokeStyle='#18a058'; ctx.strokeRect(x1,y1,x2-x1,y2-y1);
-      const tag=`${d.label} ${d.score.toFixed(2)}`; 
-      const tw=ctx.measureText(tag).width+6;
-      ctx.fillStyle='rgba(24,160,88,0.9)'; ctx.fillRect(x1,Math.max(0,y1-18),tw,18);
-      ctx.fillStyle='#fff'; ctx.fillText(tag,x1+3,Math.max(12,y1-4));
-    }
 
-    const lat=performance.now()-t0; latEl.textContent=lat.toFixed(1);
-    const dt=t-last; last=t; const fps=1000/dt; emaFps=emaFps?emaFps*0.9+fps*0.1:fps; fpsEl.textContent=emaFps.toFixed(1);
-    confEl.textContent=(maxScore*100).toFixed(1);
-    if(running) raf=requestAnimationFrame(loop);
-  }
 
   // === 백그라운드 로딩 (WASM 고정 + 경로 명시 + 타임아웃) ===
-  (async ()=>{
-    try{
-      const timeout = new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), LOAD_TIMEOUT_MS));
-      await ensureORT();
-      // WASM 파일 경로 명시(중요)
+(async ()=>{
+  try{
+    const timeout = new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), LOAD_TIMEOUT_MS));
+    ORT = await ensureORT();
+
+    // 실행 백엔드 선택
+    const hasWebGPU = !!ORT?.env?.webgpu;
+    const EP = hasWebGPU ? ['webgpu','wasm'] : ['wasm'];
+
+    // WASM 튜닝(폴백 시만 적용)
+    if (!hasWebGPU) {
       ORT.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
-      ORT.env.wasm.numThreads = 1;
+      ORT.env.wasm.numThreads = 2;   // 코어 상황에 따라 2~4
       ORT.env.wasm.simd = true;
-
-      try{ labels = await fetch(LABELS_URL).then(r=>r.json()); }catch(e){ console.warn('labels.json load fail', e); }
-
-      connEl.textContent='모델 로딩중';
-      // EP는 wasm만(안정)
-      const createPromise = ORT.InferenceSession.create(MODEL_URL_FP32, { executionProviders:['wasm'], graphOptimizationLevel:'all' });
-      session = await Promise.race([createPromise, timeout]);
-
-      // ▶ 모델 메타데이터에서 입력 이름/크기 자동 설정
-      const meta = session.inputMetadata;
-      inName = session.inputNames ? session.inputNames[0] : Object.keys(meta)[0];
-      const dims = meta[inName].dimensions; // [N, C, H, W]
-      const H = Number(dims[2]), W = Number(dims[3]);
-      if (Number.isFinite(H) && Number.isFinite(W)) {
-        INPUT_H = H; INPUT_W = W;
-        console.log('model input size =', INPUT_W, INPUT_H, 'input name =', inName);
-      }
-
-
-      connEl.textContent='준비됨';
-    }catch(e){
-      console.error(e);
-      connEl.textContent = (e?.message==='timeout') ? '모델 로딩 실패(네트워크/용량)' : '모델 로딩 실패';
     }
-  })();
+
+    try{ labels = await fetch(LABELS_URL).then(r=>r.json()); }catch(e){ console.warn('labels.json load fail', e); }
+
+    connEl.textContent='모델 로딩중';
+    const createPromise = ORT.InferenceSession.create(
+      MODEL_URL_FP32,
+      { executionProviders: EP, graphOptimizationLevel:'all' }
+    );
+    session = await Promise.race([createPromise, timeout]);
+
+    // ▶ 모델 메타데이터에서 입력 이름/크기 자동 설정
+    const meta = session.inputMetadata;
+    inName = session.inputNames ? session.inputNames[0] : Object.keys(meta)[0];
+    const dims = meta[inName].dimensions; // [N,C,H,W]
+    const H = Number(dims[2]), W = Number(dims[3]);
+    if (Number.isFinite(H) && Number.isFinite(W)) {
+      INPUT_H = H; INPUT_W = W;
+      console.log('model input size =', INPUT_W, INPUT_H, 'input name =', inName);
+    }
+
+    connEl.textContent='준비됨';
+  }catch(e){
+    console.error(e);
+    connEl.textContent = (e?.message==='timeout') ? '모델 로딩 실패(네트워크/용량)' : '모델 로딩 실패';
+  }
+})();
 </script>
 
 </body>
