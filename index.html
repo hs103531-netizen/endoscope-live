@@ -79,7 +79,7 @@
     const rgba=ox.getImageData(0,0,W,H).data;
     for(let i=0,j=0;i<hw;i++,j+=4){
       const r=rgba[j]/255,g=rgba[j+1]/255,b=rgba[j+2]/255;
-      arr[i]=r; arr[i+hw]=g; arr[i+2*hw]=b; // 단순 정규화 제거, 모델에 맞게 수정 가능
+      arr[i]=r; arr[i+hw]=g; arr[i+2*hw]=b;
     }
     return new ORT.Tensor('float32',arr,[1,3,H,W]);
   }
@@ -130,21 +130,24 @@
     try{ out = await session.run(feeds); }
     catch(e){ console.error('OrtRun error', e); connEl.textContent='추론 오류'; busy=false; scheduleNext(); return; }
 
-    console.log("out keys:", Object.keys(out));
-
     const boxesT  = out["dets"];
     const labelsT = out["labels"];
-    console.log("dims dets:", boxesT.dims, "dims labels:", labelsT.dims);
 
     const boxes = boxesT.data;
     const labelsData = labelsT.data;
 
+    // === debug log: 첫 프레임에서 값 확인 ===
+    if (last === performance.now()) {
+      console.log("sample dets:", Array.from(boxes.slice(0,20)));
+      console.log("sample labels:", Array.from(labelsData.slice(0,20)));
+    }
+
     const dets=[]; let maxScore=0;
     for(let i=0;i<boxes.length/4;i++){
-      const x1 = boxes[i*4+0]*canvas.width;
-      const y1 = boxes[i*4+1]*canvas.height;
-      const x2 = boxes[i*4+2]*canvas.width;
-      const y2 = boxes[i*4+3]*canvas.height;
+      const x1 = boxes[i*4+0];
+      const y1 = boxes[i*4+1];
+      const x2 = boxes[i*4+2];
+      const y2 = boxes[i*4+3];
 
       const cls  = labelsData[i*2+0];
       const conf = labelsData[i*2+1];
