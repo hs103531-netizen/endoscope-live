@@ -38,8 +38,7 @@
   const LABELS_URL     = "https://huggingface.co/jdi1009/endoscope-assets/resolve/main/labels.json";
 
   let INPUT_W = 560, INPUT_H = 560;
-  const MEAN=[0.485,0.456,0.406], STD=[0.229,0.224,0.225];
-  const CONF_TH=0.1, NMS_IOU=0.5, TOPK=100; // threshold 낮춤
+  const CONF_TH=0.1, NMS_IOU=0.5;
   const LOAD_TIMEOUT_MS = 120000;
 
   let inName="input", ORT=null, session=null, labels=["polyp"];
@@ -64,7 +63,6 @@
     await loadScript("https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js");
     return window.ort;
   }
-  function cxcywh2xyxy(b,W=INPUT_W,H=INPUT_H){const[cx,cy,w,h]=b;return[(cx-w/2)*W,(cy-h/2)*H,(cx+w/2)*W,(cy+h/2)*H]}
   function iou(a,b){const[ax1,ay1,ax2,ay2]=a,[bx1,by1,bx2,by2]=b;const ix1=Math.max(ax1,bx1),iy1=Math.max(ay1,by1);const ix2=Math.min(ax2,bx2),iy2=Math.min(ay2,by2);const iw=Math.max(0,ix2-ix1),ih=Math.max(0,iy2-iy1);const inter=iw*ih;const u=(ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-inter+1e-6;return inter/u}
   function nms(d,thr=NMS_IOU){d.sort((a,b)=>b.score-a.score);const keep=[];for(const x of d){let ok=true;for(const y of keep){if(iou(x.xyxy,y.xyxy)>thr){ok=false;break}}if(ok)keep.push(x)}return keep}
 
@@ -81,9 +79,7 @@
     const rgba=ox.getImageData(0,0,W,H).data;
     for(let i=0,j=0;i<hw;i++,j+=4){
       const r=rgba[j]/255,g=rgba[j+1]/255,b=rgba[j+2]/255;
-      arr[i]=(r-MEAN[0])/STD[0];
-      arr[i+hw]=(g-MEAN[1])/STD[1];
-      arr[i+2*hw]=(b-MEAN[2])/STD[2];
+      arr[i]=r; arr[i+hw]=g; arr[i+2*hw]=b; // 단순 정규화 제거, 모델에 맞게 수정 가능
     }
     return new ORT.Tensor('float32',arr,[1,3,H,W]);
   }
@@ -136,22 +132,26 @@
 
     console.log("out keys:", Object.keys(out));
 
-    const logitsT = out["pred_logits"] || out[Object.keys(out)[0]];
-    const boxesT  = out["pred_boxes"]  || out[Object.keys(out)[1]];
-    console.log("dims logits:", logitsT.dims, "dims boxes:", boxesT.dims);
+    const boxesT  = out["dets"];
+    const labelsT = out["labels"];
+    console.log("dims dets:", boxesT.dims, "dims labels:", labelsT.dims);
 
-    const logits = logitsT.data, boxes=boxesT.data;
-    const Q=boxes.length/4; const C=logits.length/Q; const FG=Math.min(labels.length || (C-1), C);
-    const exps=new Float32Array(C);
+    const boxes = boxesT.data;
+    const labelsData = labelsT.data;
 
     const dets=[]; let maxScore=0;
-    for(let q=0;q<Math.min(Q,TOPK);q++){
-      const offs=q*C; let m=-1e9; for(let i=0;i<C;i++){ if(logits[offs+i]>m)m=logits[offs+i]; }
-      let sum=0; for(let i=0;i<C;i++){ const v=Math.exp(logits[offs+i]-m); exps[i]=v; sum+=v; }
-      let best=0, idx=0; for(let i=0;i<FG;i++){ const p=exps[i]/sum; if(p>best){best=p; idx=i;} }
-      if(best<CONF_TH) continue;
-      const xyxy=cxcywh2xyxy([boxes[q*4],boxes[q*4+1],boxes[q*4+2],boxes[q*4+3]], canvas.width, canvas.height);
-      dets.push({xyxy,label:labels[idx]??String(idx),score:best}); if(best>maxScore) maxScore=best;
+    for(let i=0;i<boxes.length/4;i++){
+      const x1 = boxes[i*4+0]*canvas.width;
+      const y1 = boxes[i*4+1]*canvas.height;
+      const x2 = boxes[i*4+2]*canvas.width;
+      const y2 = boxes[i*4+3]*canvas.height;
+
+      const cls  = labelsData[i*2+0];
+      const conf = labelsData[i*2+1];
+
+      if(conf<CONF_TH) continue;
+      dets.push({xyxy:[x1,y1,x2,y2], label: labels[cls]??String(cls), score:conf});
+      if(conf>maxScore) maxScore=conf;
     }
 
     const final=nms(dets,NMS_IOU);
