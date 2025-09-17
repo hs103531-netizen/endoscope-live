@@ -42,7 +42,7 @@
   const CONF_TH=0.35, NMS_IOU=0.5, TOPK=100;
   const LOAD_TIMEOUT_MS = 120000;
 
-  let inName=null, ORT=null, session=null, labels=["object"];
+  let inName="input", ORT=null, session=null, labels=["object"];
 
   const cam=document.getElementById('cam');
   const canvas=document.getElementById('view');
@@ -186,15 +186,9 @@
 
     try{
       session = await ORT.InferenceSession.create(buf, { executionProviders: navigator.gpu?["webgpu","wasm"]:["wasm"], graphOptimizationLevel:'all' });
-      const meta=session.inputMetadata;
-      const names = session.inputNames || Object.keys(meta);
-      inName = names[0];
-      console.log("Available inputs:", names, meta);
-      let dims=[];
-      if(meta[inName] && meta[inName].dimensions){ dims = meta[inName].dimensions; }
-      let H=INPUT_H, W=INPUT_W;
-      if(dims.length===4){ H=Number(dims[2]); W=Number(dims[3]); }
-      INPUT_H=H; INPUT_W=W; initPreprocess(W,H);
+      // inName은 이미 "input"으로 고정됨
+      console.log("Available inputs:", session.inputNames, session.inputMetadata);
+      initPreprocess(INPUT_W, INPUT_H);
       connEl.textContent='준비됨';
     }catch(e){
       console.error('Model load/init failed', e);
