@@ -39,10 +39,10 @@
 
   let INPUT_W = 560, INPUT_H = 560;
   const MEAN=[0.485,0.456,0.406], STD=[0.229,0.224,0.225];
-  const CONF_TH=0.35, NMS_IOU=0.5, TOPK=100;
+  const CONF_TH=0.1, NMS_IOU=0.5, TOPK=100; // threshold 낮춤
   const LOAD_TIMEOUT_MS = 120000;
 
-  let inName="input", ORT=null, session=null, labels=["object"];
+  let inName="input", ORT=null, session=null, labels=["polyp"];
 
   const cam=document.getElementById('cam');
   const canvas=document.getElementById('view');
@@ -134,9 +134,11 @@
     try{ out = await session.run(feeds); }
     catch(e){ console.error('OrtRun error', e); connEl.textContent='추론 오류'; busy=false; scheduleNext(); return; }
 
-    const names = Object.keys(out);
-    const logitsT = out[names.find(n=>n.toLowerCase().includes('logit')) || names[0]];
-    const boxesT  = out[names.find(n=>n.toLowerCase().includes('box'))   || names[1]];
+    console.log("out keys:", Object.keys(out));
+
+    const logitsT = out["pred_logits"] || out[Object.keys(out)[0]];
+    const boxesT  = out["pred_boxes"]  || out[Object.keys(out)[1]];
+    console.log("dims logits:", logitsT.dims, "dims boxes:", boxesT.dims);
 
     const logits = logitsT.data, boxes=boxesT.data;
     const Q=boxes.length/4; const C=logits.length/Q; const FG=Math.min(labels.length || (C-1), C);
@@ -186,8 +188,6 @@
 
     try{
       session = await ORT.InferenceSession.create(buf, { executionProviders: navigator.gpu?["webgpu","wasm"]:["wasm"], graphOptimizationLevel:'all' });
-      // inName은 이미 "input"으로 고정됨
-      console.log("Available inputs:", session.inputNames, session.inputMetadata);
       initPreprocess(INPUT_W, INPUT_H);
       connEl.textContent='준비됨';
     }catch(e){
