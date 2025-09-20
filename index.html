@@ -136,12 +136,6 @@
     const boxes = boxesT.data;
     const labelsData = labelsT.data;
 
-    // === debug log: 첫 프레임에서 값 확인 ===
-    if (last === performance.now()) {
-      console.log("sample dets:", Array.from(boxes.slice(0,20)));
-      console.log("sample labels:", Array.from(labelsData.slice(0,20)));
-    }
-
     const dets=[]; let maxScore=0;
     for(let i=0;i<boxes.length/4;i++){
       const x1 = boxes[i*4+0];
@@ -150,7 +144,12 @@
       const y2 = boxes[i*4+3];
 
       const cls  = labelsData[i*2+0];
-      const conf = labelsData[i*2+1];
+      const rawConf = labelsData[i*2+1];
+      const conf = 1 / (1 + Math.exp(-rawConf)); // sigmoid 정규화
+
+      if(i < 5) {
+        console.log("det", [x1,y1,x2,y2], "cls", cls, "rawConf", rawConf, "sigmoid", conf);
+      }
 
       if(conf<CONF_TH) continue;
       dets.push({xyxy:[x1,y1,x2,y2], label: labels[cls]??String(cls), score:conf});
